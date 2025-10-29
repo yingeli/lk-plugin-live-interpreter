@@ -1,0 +1,198 @@
+# LiveKit Cloud Deployment Configuration
+# Upload this file to LiveKit Cloud Dashboard → Agents → New Agent
+
+apiVersion: agents.livekit.io/v1alpha1
+kind: Agent
+metadata:
+  name: azure-live-interpreter
+  labels:
+    app: translation
+    provider: azure
+    version: v0.1.0
+
+spec:
+  # Agent display name in dashboard
+  displayName: "Azure Live Interpreter"
+
+  # Description
+  description: |
+    Real-time speech-to-speech translation using Azure Live Interpreter API.
+    Supports 90+ languages with automatic language detection and personal voice preservation.
+
+  # Source code configuration
+  source:
+    # Option 1: Git repository
+    git:
+      url: https://github.com/your-username/lk-plugin-live-interpreter
+      branch: main
+      path: .
+
+    # Option 2: Docker image (uncomment if using Docker)
+    # docker:
+    #   image: your-registry/azure-live-interpreter:latest
+    #   pullPolicy: Always
+
+  # Entry point
+  entrypoint:
+    file: examples/multi_language_meeting.py
+    function: entrypoint
+
+  # Runtime configuration
+  runtime:
+    language: python
+    version: "3.11"
+
+    # Install plugin before running
+    setup:
+      - pip install ./livekit-plugins/livekit-plugins-azure
+      - pip install python-dotenv
+
+  # Environment variables (configure in Dashboard → Secrets)
+  env:
+    # Required
+    - name: AZURE_SPEECH_KEY
+      valueFrom:
+        secretKeyRef:
+          name: azure-credentials
+          key: speech-key
+
+    - name: AZURE_SPEECH_REGION
+      valueFrom:
+        secretKeyRef:
+          name: azure-credentials
+          key: region
+
+    # Optional
+    - name: AZURE_SPEAKER_PROFILE_ID
+      valueFrom:
+        secretKeyRef:
+          name: azure-credentials
+          key: speaker-profile-id
+          optional: true
+
+    # Logging
+    - name: LOG_LEVEL
+      value: "INFO"
+
+  # Resource limits
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+  # Auto-scaling configuration
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 5
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 70
+      - type: Resource
+        resource:
+          name: memory
+          target:
+            type: Utilization
+            averageUtilization: 80
+
+  # Health check
+  health:
+    livenessProbe:
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+
+    readinessProbe:
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+
+  # Room joining configuration
+  roomConfig:
+    # Auto-join all rooms (default)
+    autoJoin: true
+
+    # Or specify room name pattern
+    # roomNamePattern: "translator-*"
+
+    # Participant identity
+    participantIdentity: "azure-translator"
+
+    # Participant name (visible in UI)
+    participantName: "Live Interpreter"
+
+    # Metadata
+    participantMetadata: |
+      {
+        "agent_type": "translator",
+        "provider": "azure",
+        "capabilities": ["speech_translation", "personal_voice"],
+        "languages": ["en", "fr", "es", "de", "zh-Hans", "ja", "ko", "ar", "ru"]
+      }
+
+  # Logging configuration
+  logging:
+    level: INFO
+    format: json
+    outputs:
+      - stdout
+      - livekit-cloud  # Send logs to LiveKit Cloud
+
+  # Monitoring
+  monitoring:
+    enabled: true
+    metrics:
+      enabled: true
+      port: 9090
+
+    # Custom metrics
+    customMetrics:
+      - name: translations_total
+        type: counter
+        description: "Total number of translations performed"
+
+      - name: translation_duration_seconds
+        type: histogram
+        description: "Translation processing duration"
+
+      - name: active_sessions
+        type: gauge
+        description: "Number of active translation sessions"
+
+  # Security
+  security:
+    # Network policy
+    networkPolicy:
+      enabled: false  # Enable if you want to restrict network access
+
+    # Pod security context
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      fsGroup: 1000
+
+  # Annotations (for cloud provider specific configuration)
+  annotations:
+    deployment.livekit.io/restart-policy: "Always"
+    deployment.livekit.io/termination-grace-period: "30"
+
+---
+# Secret configuration (create in LiveKit Cloud Dashboard)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: azure-credentials
+type: Opaque
+stringData:
+  speech-key: "your-azure-speech-key-here"
+  region: "eastus"
+  speaker-profile-id: "optional-profile-id"

@@ -1,0 +1,63 @@
+# LiveKit Agent Configuration for Azure Live Interpreter
+# This file is used for deploying the agent to LiveKit Cloud
+
+# Agent metadata
+name: azure-live-interpreter
+version: 0.1.0
+description: Real-time speech translation using Azure Live Interpreter API
+
+# Entry point for the agent
+entrypoint: examples/multi_language_meeting.py
+
+# Python runtime configuration
+runtime:
+  python_version: "3.11"
+
+# Dependencies
+dependencies:
+  # Core dependencies
+  - livekit-agents>=0.8.0
+  - azure-cognitiveservices-speech>=1.40.0
+  - aiohttp>=3.9.0
+  - python-dotenv>=1.0.0
+
+# Environment variables (set these in LiveKit Cloud dashboard)
+environment:
+  # Required: Azure Speech Service credentials
+  - AZURE_SPEECH_KEY
+  - AZURE_SPEECH_REGION
+
+  # Optional: Custom speaker profile
+  - AZURE_SPEAKER_PROFILE_ID
+
+  # Optional: Logging level
+  - LOG_LEVEL=INFO
+
+# Agent resources
+resources:
+  # Memory allocation
+  memory: 512Mi
+
+  # CPU allocation
+  cpu: "0.5"
+
+  # Number of agent instances
+  replicas: 1
+
+# Health check configuration
+health_check:
+  enabled: true
+  interval: 30s
+  timeout: 10s
+
+# Auto-scaling configuration
+autoscaling:
+  enabled: false
+  min_replicas: 1
+  max_replicas: 3
+  target_cpu_utilization: 70
+
+# Logging configuration
+logging:
+  level: INFO
+  format: json
