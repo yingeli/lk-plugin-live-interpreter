@@ -1,293 +1,211 @@
-# Quick Start Guide
+# 快速开始指南 (Quick Start Guide)
 
-Get up and running with Azure Live Interpreter in 5 minutes!
+5 分钟快速上手 Azure Live Interpreter 插件本地测试。
 
-## Prerequisites
+## 前提条件
 
 - Python 3.9+
-- Azure account with Speech Service subscription
-- Personal Voice access (required for Live Interpreter)
+- Azure Speech Service 订阅 (获取 Key 和 Region)
+- LiveKit 账号 (免费注册: https://cloud.livekit.io)
 
-## Step 1: Azure Setup (5 minutes)
+## 快速设置
 
-### 1.1 Create Speech Service Resource
-
-1. Go to [Azure Portal](https://portal.azure.com/)
-2. Click "Create a resource"
-3. Search for "Speech"
-4. Click "Create" → "Speech"
-5. Fill in:
-   - **Subscription**: Your subscription
-   - **Resource group**: Create new or use existing
-   - **Region**: `East US` (recommended)
-   - **Name**: Choose a unique name
-   - **Pricing tier**: `S0` (Standard)
-6. Click "Review + Create" → "Create"
-7. Wait for deployment (~1 minute)
-
-### 1.2 Get Your Credentials
-
-1. Go to your Speech resource
-2. Click "Keys and Endpoint" in left menu
-3. Copy:
-   - **Key 1** (your subscription key)
-   - **Location/Region** (e.g., `eastus`)
-
-### 1.3 Apply for Personal Voice Access
-
-1. Go to https://aka.ms/customneural
-2. Fill out the form
-3. **Important**: Select "Personal Voice" for Question 20
-4. Submit and wait for approval (usually 1-2 business days)
-
-## Step 2: Installation (1 minute)
+### 1. 自动化设置（推荐）
 
 ```bash
-# Clone the repository
-git clone https://github.com/livekit/agents.git
-cd agents/lk-plugin-realtime
+# 克隆或进入项目目录
+cd lk-plugin-live-interpreter
 
-# Install the plugin
+# 运行自动化设置脚本
+./setup_local_dev.sh
+```
+
+这个脚本会自动：
+- ✓ 创建虚拟环境
+- ✓ 安装所有依赖
+- ✓ 以开发模式安装插件
+- ✓ 创建 .env 模板
+
+### 2. 配置凭证
+
+编辑 `.env` 文件：
+
+```bash
+vim .env
+```
+
+填入您的凭证：
+
+```bash
+# Azure Speech Service
+AZURE_SPEECH_KEY=your_actual_key_here
+AZURE_SPEECH_REGION=eastus
+
+# LiveKit (从 https://cloud.livekit.io 获取)
+LIVEKIT_URL=wss://your-project.livekit.cloud
+LIVEKIT_API_KEY=your_api_key
+LIVEKIT_API_SECRET=your_api_secret
+```
+
+### 3. 验证安装
+
+```bash
+# 激活虚拟环境
+source venv/bin/activate
+
+# 运行测试脚本
+python examples/test_local.py
+```
+
+如果看到 "所有测试通过！✨"，说明配置成功！
+
+### 4. 运行示例
+
+```bash
+# 简单双语翻译 (英语 → 法语 + 西班牙语)
+python examples/simple_interpreter.py
+
+# 多语言会议 (8 种语言同声传译)
+python examples/multi_language_meeting.py
+```
+
+## 手动设置（可选）
+
+如果您更喜欢手动设置：
+
+```bash
+# 1. 创建虚拟环境
+python3 -m venv venv
+source venv/bin/activate
+
+# 2. 安装依赖
+pip install livekit-agents livekit-cli
+
+# 3. 安装插件（开发模式）
 cd livekit-plugins/livekit-plugins-azure
 pip install -e .
+cd ../..
 
-# Install example dependencies
-pip install python-dotenv
+# 4. 配置环境变量（同上）
+vim .env
+
+# 5. 测试
+python examples/test_local.py
 ```
 
-## Step 3: Configuration (1 minute)
+## 测试方法
+
+### 方法 1: LiveKit Playground（最简单）
+
+1. 访问 https://cloud.livekit.io
+2. 进入您的项目
+3. 点击 "Playground"
+4. 创建测试房间
+5. 启用麦克风，开始说话
+
+### 方法 2: LiveKit CLI
 
 ```bash
-# Set environment variables
-export AZURE_SPEECH_KEY="your-subscription-key-here"
-export AZURE_SPEECH_REGION="eastus"
+# 安装 CLI
+pip install livekit-cli
 
-# Or create .env file
-cd examples
-cp .env.example .env
-# Edit .env and add your credentials
+# 创建房间令牌
+lk token create \
+  --api-key $LIVEKIT_API_KEY \
+  --api-secret $LIVEKIT_API_SECRET \
+  --join --room test-room \
+  --identity user1 \
+  --valid-for 24h
 ```
 
-## Step 4: Run Your First Interpreter (2 minutes)
+### 方法 3: Web 客户端
 
-### Option A: Quick Test
+使用 LiveKit 的示例应用: https://meet.livekit.io/
 
-```bash
-cd examples
-python simple_interpreter.py dev
-```
+## 基本使用示例
 
-This starts an agent that translates to French and Spanish.
-
-### Option B: Multi-Language Meeting
-
-```bash
-python multi_language_meeting.py dev
-```
-
-This translates to 8 languages simultaneously!
-
-## Step 5: Test It Out
-
-### Using LiveKit CLI
-
-```bash
-# Terminal 1: Agent is running from Step 4
-
-# Terminal 2: Join as a participant
-livekit-cli join-room \
-  --url ws://localhost:7880 \
-  --api-key devkey \
-  --api-secret secret \
-  --room test-room \
-  --identity user1
-```
-
-Now speak into your microphone and see real-time translations!
-
-### Using LiveKit Playground
-
-1. Go to [LiveKit Playground](https://meet.livekit.io/)
-2. Enter your room details:
-   - **URL**: `ws://localhost:7880`
-   - **Token**: Generate using devkey/secret
-   - **Room**: `test-room`
-3. Join and start speaking!
-
-## What's Happening?
-
-```
-Your Voice (any language)
-    ↓
-Live Interpreter detects language automatically
-    ↓
-Translates to configured languages (French, Spanish, etc.)
-    ↓
-Plays back in YOUR voice style
-```
-
-## Common Issues & Solutions
-
-### "Personal Voice access required"
-
-**Problem**: You haven't been approved yet
-**Solution**: Wait for Azure approval or disable personal voice:
+创建您自己的 Agent：
 
 ```python
-LiveInterpreterModel(
-    target_languages=["fr", "es"],
-    use_personal_voice=False,  # Use standard voices temporarily
-)
-```
-
-### "Invalid subscription key"
-
-**Problem**: Incorrect credentials
-**Solution**: Double-check your key and region:
-
-```bash
-# Verify in Azure Portal
-# Keys and Endpoint → Key 1 → Copy
-
-echo $AZURE_SPEECH_KEY     # Should show your key
-echo $AZURE_SPEECH_REGION  # Should show "eastus" or your region
-```
-
-### "Connection failed"
-
-**Problem**: Network or region issue
-**Solution**:
-- Check internet connection
-- Verify region is supported
-- Try `eastus` or `westus2`
-
-### "No audio output"
-
-**Problem**: Audio configuration issue
-**Solution**: Check microphone permissions and audio devices
-
-## Next Steps
-
-### Customize Your Interpreter
-
-Edit `examples/simple_interpreter.py`:
-
-```python
-# Change target languages
-azure.realtime.LiveInterpreterModel(
-    target_languages=["de", "ja", "ko"],  # German, Japanese, Korean
-    use_personal_voice=True,
-)
-```
-
-### Add to Your Application
-
-```python
+# my_interpreter.py
 from livekit.agents import JobContext, WorkerOptions, cli
 from livekit.agents.voice import AgentSession
 from livekit.plugins import azure
 
 async def entrypoint(ctx: JobContext):
-    session = AgentSession(
-        llm=azure.realtime.LiveInterpreterModel(
-            target_languages=["fr", "es"],
-            use_personal_voice=True,
-        )
+    # 创建翻译模型
+    model = azure.realtime.LiveInterpreterModel(
+        target_languages=["fr", "es", "de"],  # 法语、西班牙语、德语
+        use_personal_voice=True,              # 使用个人语音
+        sample_rate=16000,                    # 采样率
     )
+
+    # 创建 Agent 会话
+    session = AgentSession(llm=model)
     await session.start(room=ctx.room)
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
 ```
 
-### Explore Examples
+运行：
 
-Check out [examples/README.md](examples/README.md) for:
-- Multi-language conference interpreter
-- Custom voice profiles
-- Advanced configuration options
-
-## Production Checklist
-
-Before deploying to production:
-
-- [ ] Use secure credential storage (Azure Key Vault)
-- [ ] Set up monitoring and alerts
-- [ ] Test with expected user load
-- [ ] Configure error handling
-- [ ] Set up logging
-- [ ] Review Azure quotas and limits
-- [ ] Plan for scaling
-- [ ] Test language combinations
-- [ ] Verify audio quality
-- [ ] Document for your team
-
-## Get Help
-
-- **Examples**: See [examples/](examples/) directory
-- **Documentation**: Read [README.md](README.md)
-- **Architecture**: Check [ARCHITECTURE.md](ARCHITECTURE.md)
-- **Issues**: Report at [GitHub Issues](https://github.com/livekit/agents/issues)
-- **Community**: Join [LiveKit Discord](https://livekit.io/community)
-
-## Supported Languages
-
-You can translate to 90+ languages including:
-
-| Popular Languages | Code |
-|-------------------|------|
-| French | `fr` |
-| Spanish | `es` |
-| German | `de` |
-| Italian | `it` |
-| Portuguese | `pt` |
-| Chinese (Simplified) | `zh-Hans` |
-| Japanese | `ja` |
-| Korean | `ko` |
-| Arabic | `ar` |
-| Russian | `ru` |
-
-Full list in [models.py](livekit-plugins/livekit-plugins-azure/livekit/plugins/azure/models.py)
-
-## Tips & Tricks
-
-### Optimize for Cost
-
-```python
-# Use fewer target languages
-target_languages=["fr"]  # Instead of ["fr", "es", "de", ...]
-
-# Use 16kHz instead of 24kHz
-sample_rate=16000  # Lower bandwidth = lower cost
+```bash
+python my_interpreter.py
 ```
 
-### Improve Quality
+## 支持的语言
 
-```python
-# Use 24kHz for better audio
-sample_rate=24000
+90+ 种语言，包括：
 
-# Enable timestamps for better sync
-enable_word_level_timestamps=True
+| 语言 | 代码 | 语言 | 代码 |
+|------|------|------|------|
+| 法语 | fr | 西班牙语 | es |
+| 德语 | de | 中文(简体) | zh-Hans |
+| 日语 | ja | 韩语 | ko |
+| 阿拉伯语 | ar | 俄语 | ru |
+
+完整列表: [models.py](livekit-plugins/livekit-plugins-azure/livekit/plugins/azure/models.py)
+
+## 常见问题
+
+### Q: "No module named build" 错误
+
+**A**: 不需要构建包进行本地测试。直接使用 `pip install -e .` 以开发模式安装。
+
+### Q: Azure 认证失败
+
+**A**: 检查：
+1. Key 和 Region 是否正确
+2. Azure 订阅是否有效
+3. 是否有 Speech Service 配额
+
+### Q: LiveKit 连接失败
+
+**A**: 检查：
+1. URL 格式是否正确 (wss://...)
+2. API Key 和 Secret 是否有效
+3. 网络连接是否正常
+
+### Q: 如何启用调试日志？
+
+**A**: 设置环境变量：
+```bash
+export LIVEKIT_LOG_LEVEL=debug
+python examples/simple_interpreter.py
 ```
 
-### Debug Issues
+## 下一步
 
-```python
-import logging
-logging.basicConfig(level=logging.DEBUG)
+- 📖 [完整本地测试指南](LOCAL_TESTING.md) - 详细的测试方法和调试技巧
+- 🚀 [部署指南](DEPLOYMENT.md) - 部署到 LiveKit Cloud
+- 🎮 [Playground 指南](PLAYGROUND_GUIDE.md) - 在线测试
+- 🏗️ [架构文档](ARCHITECTURE.md) - 技术实现细节
 
-# Now you'll see detailed logs
-```
+## 获取帮助
 
-## What's Next?
+- 查看 [LOCAL_TESTING.md](LOCAL_TESTING.md) 的故障排查部分
+- 访问 LiveKit Discord: https://livekit.io/discord
+- Azure 支持: https://azure.microsoft.com/support/
 
-Congratulations! You now have a working Live Interpreter.
-
-Explore advanced features:
-- Custom voice profiles
-- Multi-participant scenarios
-- Integration with your app
-- Production deployment
-
-Happy translating! 🌐🎤
+祝使用愉快！🎉

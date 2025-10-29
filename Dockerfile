@@ -20,14 +20,14 @@ COPY livekit-plugins/livekit-plugins-azure /app/livekit-plugins-azure
 # Install the plugin
 RUN pip install --no-cache-dir /app/livekit-plugins-azure
 
-# Copy example agents
-COPY examples /app/examples
-
-# Copy requirements if exists
-COPY requirements.txt* /app/ || true
+# Copy requirements.txt
+COPY requirements.txt /app/requirements.txt
 
 # Install additional dependencies
-RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy example agents
+COPY examples /app/examples
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

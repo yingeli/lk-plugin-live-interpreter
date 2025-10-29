@@ -16,6 +16,44 @@ Official LiveKit Agent plugin for **Azure Live Interpreter API** - Real-time spe
 
 ## Quick Start
 
+### Local Testing (Recommended for Development)
+
+#### Quick Setup with Makefile
+
+```bash
+# 1. Setup development environment
+make setup
+
+# 2. Configure environment variables
+vim .env
+
+# 3. Test installation
+make test-quick
+
+# 4. Run examples
+make run-simple
+```
+
+#### Manual Setup
+
+```bash
+# 1. Run automated setup
+./setup_local_dev.sh
+
+# 2. Configure environment variables
+vim .env
+
+# 3. Test installation
+python examples/test_local.py
+
+# 4. Run examples
+python examples/simple_interpreter.py
+```
+
+**📖 See [LOCAL_TESTING.md](LOCAL_TESTING.md) for complete local testing guide**
+
+**💡 Run `make help` to see all available commands**
+
 ### Installation
 
 ```bash
@@ -136,6 +174,11 @@ See [PLAYGROUND_GUIDE.md](PLAYGROUND_GUIDE.md) for step-by-step instructions.
 
 ## Documentation
 
+### Getting Started
+- [Quick Start](QUICKSTART.md) - 5-minute setup guide
+- [Local Testing Guide](LOCAL_TESTING.md) - Complete local testing guide
+- [Local Testing Summary](LOCAL_TESTING_SUMMARY.md) - Testing resources overview
+
 ### Plugin Documentation
 - [Plugin README](livekit-plugins/livekit-plugins-azure/README.md) - Plugin API reference
 - [Architecture](ARCHITECTURE.md) - Technical architecture details
@@ -144,7 +187,9 @@ See [PLAYGROUND_GUIDE.md](PLAYGROUND_GUIDE.md) for step-by-step instructions.
 ### Deployment Documentation
 - [Deployment Guide](DEPLOYMENT.md) - Deploy to LiveKit Cloud
 - [Playground Guide](PLAYGROUND_GUIDE.md) - Test in playground
-- [Quick Start](QUICKSTART.md) - 5-minute setup guide
+- [Deployment Troubleshooting](DEPLOYMENT_TROUBLESHOOTING.md) - Fix common deployment issues
+- [Docker Fix Guide](DOCKER_FIX.md) - Docker-specific fixes
+- [LiveKit CLI Commands](LIVEKIT_CLI_COMMANDS.md) - CLI command reference
 
 ### External Resources
 - [Azure Live Interpreter Docs](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/how-to-translate-speech)
