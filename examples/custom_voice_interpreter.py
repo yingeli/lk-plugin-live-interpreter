@@ -37,7 +37,6 @@ from dotenv import load_dotenv
 
 from livekit.agents import JobContext, WorkerOptions, cli
 from livekit.agents.voice import AgentSession
-from livekit.agents.voice.room_io import RoomInputOptions, RoomOutputOptions
 from livekit.plugins import azure
 
 logger = logging.getLogger("custom-voice-interpreter")
@@ -82,12 +81,6 @@ async def entrypoint(ctx: JobContext):
             enable_word_level_timestamps=True,
         ),
         room=ctx.room,
-        room_input_options=RoomInputOptions(
-            auto_subscribe=True,
-        ),
-        room_output_options=RoomOutputOptions(
-            transcription_enabled=True,
-        ),
     )
 
     logger.info("Custom voice interpreter ready")

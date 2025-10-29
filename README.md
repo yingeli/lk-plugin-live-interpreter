@@ -187,9 +187,12 @@ See [PLAYGROUND_GUIDE.md](PLAYGROUND_GUIDE.md) for step-by-step instructions.
 ### Deployment Documentation
 - [Deployment Guide](DEPLOYMENT.md) - Deploy to LiveKit Cloud
 - [Playground Guide](PLAYGROUND_GUIDE.md) - Test in playground
+- [Redeploy Instructions](REDEPLOY_INSTRUCTIONS.md) - Quick redeploy guide
 - [Deployment Troubleshooting](DEPLOYMENT_TROUBLESHOOTING.md) - Fix common deployment issues
 - [Docker Fix Guide](DOCKER_FIX.md) - Docker-specific fixes
+- [API Compatibility Fix](API_COMPATIBILITY_FIX.md) - LiveKit Agents API updates
 - [LiveKit CLI Commands](LIVEKIT_CLI_COMMANDS.md) - CLI command reference
+- [Configure Azure Credentials](CONFIGURE_AZURE_CREDENTIALS.md) - Azure setup guide
 
 ### External Resources
 - [Azure Live Interpreter Docs](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/how-to-translate-speech)

@@ -39,7 +39,6 @@ from dotenv import load_dotenv
 
 from livekit.agents import JobContext, WorkerOptions, cli
 from livekit.agents.voice import AgentSession
-from livekit.agents.voice.room_io import RoomInputOptions, RoomOutputOptions
 from livekit.plugins import azure
 
 logger = logging.getLogger("multi-language-meeting")
@@ -90,14 +89,6 @@ async def entrypoint(ctx: JobContext):
             profanity_option="masked",  # Mask profanity in transcripts
         ),
         room=ctx.room,
-        room_input_options=RoomInputOptions(
-            auto_subscribe=True,
-            # Optional: filter specific participants
-            # participant_identity="speaker1",
-        ),
-        room_output_options=RoomOutputOptions(
-            transcription_enabled=True,
-        ),
     )
 
     logger.info("Multi-language interpreter ready")

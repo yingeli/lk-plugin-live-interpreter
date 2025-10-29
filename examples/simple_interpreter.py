@@ -32,7 +32,6 @@ from dotenv import load_dotenv
 
 from livekit.agents import JobContext, WorkerOptions, cli
 from livekit.agents.voice import AgentSession
-from livekit.agents.voice.room_io import RoomInputOptions, RoomOutputOptions
 from livekit.plugins import azure
 
 # Configure logging
@@ -68,14 +67,6 @@ async def entrypoint(ctx: JobContext):
             sample_rate=16000,  # 16kHz audio
         ),
         room=ctx.room,
-        room_input_options=RoomInputOptions(
-            # Listen to all participants
-            auto_subscribe=True,
-        ),
-        room_output_options=RoomOutputOptions(
-            # Enable transcription display
-            transcription_enabled=True,
-        ),
     )
 
     logger.info("Live Interpreter session started successfully")
