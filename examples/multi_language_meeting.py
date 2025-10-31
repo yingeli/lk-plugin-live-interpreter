@@ -38,7 +38,7 @@ from typing import List
 from dotenv import load_dotenv
 
 from livekit.agents import JobContext, WorkerOptions, cli
-from livekit.agents.voice import AgentSession
+from livekit.agents.voice import Agent, AgentSession
 from livekit.plugins import azure
 
 logger = logging.getLogger("multi-language-meeting")
@@ -77,10 +77,9 @@ async def entrypoint(ctx: JobContext):
     )
     logger.info(f"Target languages: {', '.join(TARGET_LANGUAGES)}")
 
-    # Create agent session
-    session = AgentSession()
-
-    await session.start(
+    # Create the agent with LiveInterpreter model
+    agent = Agent(
+        instructions="You are a multi-language interpreter. Translate speech to multiple languages in real-time.",
         llm=azure.realtime.LiveInterpreterModel(
             target_languages=TARGET_LANGUAGES,
             use_personal_voice=True,
@@ -88,15 +87,20 @@ async def entrypoint(ctx: JobContext):
             enable_word_level_timestamps=True,  # Enable detailed timing
             profanity_option="masked",  # Mask profanity in transcripts
         ),
+    )
+
+    # Create agent session
+    session = AgentSession()
+
+    await session.start(
+        agent=agent,
         room=ctx.room,
     )
 
     logger.info("Multi-language interpreter ready")
 
-    # Keep the session alive
-    await session.wait_for_completion()
-
-    logger.info("Multi-language interpreter session ended")
+    # Session will remain active until the room is closed
+    # No need to explicitly wait - the session handles this automatically
 
 
 if __name__ == "__main__":

@@ -1,44 +1,33 @@
-# Copyright 2024 LiveKit, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from __future__ import annotations
 
 import asyncio
+import audioop
+import contextlib
+import io
 import os
-from dataclasses import dataclass
-from typing import Any, Literal, Optional
+import time
+import wave
+import weakref
+from dataclasses import dataclass, field
+from typing import Literal, Optional
 
 import azure.cognitiveservices.speech as speechsdk
 from livekit import rtc
-from livekit.agents import (
-    DEFAULT_API_CONNECT_OPTIONS,
-    APIConnectionError,
-    APIStatusError,
-    APITimeoutError,
-    llm,
-    utils,
-)
+from livekit.agents import APIConnectionError, llm, utils
+from livekit.agents.types import NOT_GIVEN, NotGivenOr
+from livekit.agents.metrics import RealtimeModelMetrics
+from livekit.agents.metrics.base import Metadata
 
 from .. import models
 from ..log import logger
 from . import utils as realtime_utils
 
 
+_AUDIO_CHUNK_MS = 20
+
+
 @dataclass
 class _LiveInterpreterOptions:
-    """Internal configuration options for Live Interpreter"""
-
     subscription_key: str
     region: str
     target_languages: list[str]
@@ -49,26 +38,25 @@ class _LiveInterpreterOptions:
     profanity_option: Literal["masked", "removed", "raw"]
 
 
-class LiveInterpreterModel(llm.LLM):
-    """
-    LiveKit Agent integration for Azure Live Interpreter API.
+@dataclass
+class _GenerationState:
+    response_id: str
+    message_ch: utils.aio.Chan[llm.MessageGeneration]
+    function_ch: utils.aio.Chan[llm.FunctionCall]
+    text_ch: utils.aio.Chan[str]
+    audio_ch: utils.aio.Chan[rtc.AudioFrame]
+    modalities: asyncio.Future[list[Literal["text", "audio"]]]
+    created_at: float
+    first_token_at: float | None = None
+    completed_at: float | None = None
+    output_text: list[str] = field(default_factory=list)
+    text_done: bool = False
+    audio_done: bool = False
+    audio_expected: bool = True
 
-    This provides real-time speech-to-speech translation with automatic language
-    detection and personal voice preservation.
 
-    Example:
-        ```python
-        from livekit.agents import AgentSession
-        from livekit.plugins import azure
-
-        session = AgentSession(
-            llm=azure.realtime.LiveInterpreterModel(
-                target_languages=["fr", "es"],
-                use_personal_voice=True,
-            )
-        )
-        ```
-    """
+class LiveInterpreterModel(llm.RealtimeModel):
+    """Live Interpreter integration backed by Azure Speech Service."""
 
     def __init__(
         self,
@@ -81,25 +69,7 @@ class LiveInterpreterModel(llm.LLM):
         sample_rate: int = 16000,
         enable_word_level_timestamps: bool = False,
         profanity_option: Literal["masked", "removed", "raw"] = "masked",
-        api_connect_options: utils.http_context.APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> None:
-        """
-        Initialize Live Interpreter model.
-
-        Args:
-            target_languages: List of target language codes (e.g., ["fr", "es", "de"])
-            subscription_key: Azure Speech subscription key (or set AZURE_SPEECH_KEY env var)
-            region: Azure region (e.g., "eastus") (or set AZURE_SPEECH_REGION env var)
-            use_personal_voice: Whether to use personal voice for synthesis
-            speaker_profile_id: Optional speaker profile ID for personal voice
-            sample_rate: Audio sample rate in Hz (16000 or 24000)
-            enable_word_level_timestamps: Enable word-level timestamps
-            profanity_option: How to handle profanity ("masked", "removed", "raw")
-            api_connect_options: API connection options
-        """
-        super().__init__()
-
-        # Get credentials from environment if not provided
         subscription_key = subscription_key or os.environ.get("AZURE_SPEECH_KEY")
         region = region or os.environ.get("AZURE_SPEECH_REGION")
 
@@ -115,16 +85,23 @@ class LiveInterpreterModel(llm.LLM):
                 "Set AZURE_SPEECH_REGION environment variable or pass region parameter."
             )
 
-        # Validate target languages
-        invalid_langs = [
-            lang for lang in target_languages
-            if lang not in models.SUPPORTED_TARGET_LANGUAGES
-        ]
-        if invalid_langs:
+        invalid = [lang for lang in target_languages if lang not in models.SUPPORTED_TARGET_LANGUAGES]
+        if invalid:
             raise ValueError(
-                f"Unsupported target languages: {invalid_langs}. "
-                f"Supported languages: {models.SUPPORTED_TARGET_LANGUAGES}"
+                "Unsupported target languages: {invalid}. Supported values are documented in "
+                "livekit.plugins.azure.models.SUPPORTED_TARGET_LANGUAGES".format(invalid=invalid)
             )
+
+        super().__init__(
+            capabilities=llm.RealtimeCapabilities(
+                message_truncation=False,
+                turn_detection=False,
+                user_transcription=True,
+                auto_tool_reply_generation=False,
+                audio_output=use_personal_voice,
+                manual_function_calls=False,
+            )
+        )
 
         self._opts = _LiveInterpreterOptions(
             subscription_key=subscription_key,
@@ -136,157 +113,188 @@ class LiveInterpreterModel(llm.LLM):
             enable_word_level_timestamps=enable_word_level_timestamps,
             profanity_option=profanity_option,
         )
-        self._api_connect_options = api_connect_options
 
-    def chat(
-        self,
-        *,
-        chat_ctx: llm.ChatContext,
-        fnc_ctx: Optional[llm.FunctionContext] = None,
-        temperature: Optional[float] = None,
-        n: int = 1,
-        parallel_tool_calls: Optional[bool] = None,
-    ) -> "LiveInterpreterSession":
-        """
-        Create a new Live Interpreter session.
+        self._sessions = weakref.WeakSet[LiveInterpreterSession]()
+        self._label = f"azure.live_interpreter.{region}"
 
-        Note: Live Interpreter does not support function calling or text-based chat.
-        This method is provided for LLM interface compatibility but only supports
-        audio-based translation.
+    @property
+    def model(self) -> str:
+        return "azure/live-interpreter"
 
-        Args:
-            chat_ctx: Chat context (not used for Live Interpreter)
-            fnc_ctx: Function context (not supported)
-            temperature: Temperature (not applicable)
-            n: Number of responses (not applicable)
-            parallel_tool_calls: Parallel tool calls (not supported)
+    @property
+    def provider(self) -> str:
+        return "azure"
 
-        Returns:
-            LiveInterpreterSession for managing the translation session
-        """
-        if fnc_ctx is not None:
-            logger.warning(
-                "Live Interpreter does not support function calling. "
-                "Function context will be ignored."
-            )
-
-        return LiveInterpreterSession(
-            opts=self._opts,
-            api_connect_options=self._api_connect_options,
-        )
-
-
-class LiveInterpreterSession(llm.LLMStream):
-    """
-    Active Live Interpreter session for real-time speech translation.
-
-    This class manages the connection to Azure Speech Service and handles
-    audio streaming, translation results, and synthesized audio output.
-    """
-
-    def __init__(
-        self,
-        *,
-        opts: _LiveInterpreterOptions,
-        api_connect_options: utils.http_context.APIConnectOptions,
-    ) -> None:
-        super().__init__()
-
-        self._opts = opts
-        self._api_connect_options = api_connect_options
-
-        # Azure Speech SDK objects
-        self._recognizer: Optional[speechsdk.translation.TranslationRecognizer] = None
-        self._audio_stream: Optional[speechsdk.audio.PushAudioInputStream] = None
-
-        # State management
-        self._session_id: Optional[str] = None
-        self._is_running = False
-        self._closed = False
-
-        # Event queue for results
-        self._event_queue: asyncio.Queue[
-            llm.ChatChunk | APIStatusError
-        ] = asyncio.Queue()
-
-        # Audio output buffer
-        self._audio_buffer = bytearray()
-        self._audio_lock = asyncio.Lock()
-
-        # Metrics
-        self._translation_count = 0
-        self._start_time: Optional[float] = None
-
-    async def __anext__(self) -> llm.ChatChunk:
-        """Get next chat chunk from the session"""
-        if self._closed:
-            raise StopAsyncIteration
-
-        try:
-            event = await self._event_queue.get()
-        except asyncio.CancelledError:
-            raise StopAsyncIteration
-
-        if isinstance(event, APIStatusError):
-            raise event
-
-        return event
+    def session(self) -> "LiveInterpreterSession":
+        sess = LiveInterpreterSession(self)
+        self._sessions.add(sess)
+        return sess
 
     async def aclose(self) -> None:
-        """Close the session and cleanup resources"""
-        if self._closed:
-            return
+        await asyncio.gather(*(sess.aclose() for sess in list(self._sessions)), return_exceptions=True)
 
-        self._closed = True
+    def update_options(
+        self,
+        *,
+        target_languages: Optional[list[str]] = None,
+        use_personal_voice: Optional[bool] = None,
+        speaker_profile_id: Optional[str] = None,
+    ) -> None:
+        if target_languages is not None:
+            invalid = [lang for lang in target_languages if lang not in models.SUPPORTED_TARGET_LANGUAGES]
+            if invalid:
+                raise ValueError(
+                    "Unsupported target languages: {invalid}.".format(invalid=invalid)
+                )
+            self._opts.target_languages = target_languages
+
+        if use_personal_voice is not None:
+            self._opts.use_personal_voice = use_personal_voice
+            self._capabilities.audio_output = use_personal_voice
+
+        if speaker_profile_id is not None:
+            self._opts.speaker_profile_id = speaker_profile_id
+
+        for sess in list(self._sessions):
+            sess.update_model_options(
+                target_languages=self._opts.target_languages,
+                use_personal_voice=self._opts.use_personal_voice,
+                speaker_profile_id=self._opts.speaker_profile_id,
+            )
+
+
+class LiveInterpreterSession(llm.RealtimeSession):
+    def __init__(self, realtime_model: LiveInterpreterModel) -> None:
+        super().__init__(realtime_model)
+        self._realtime_model = realtime_model
+        self._opts = realtime_model._opts
 
         try:
-            await self._stop_recognition()
-        except Exception as e:
-            logger.error(f"Error stopping recognition: {e}")
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.get_event_loop_policy().get_event_loop()
 
-        # Cleanup Azure SDK resources
-        if self._recognizer:
-            try:
-                # Disconnect event handlers
-                self._recognizer.recognizing.disconnect_all()
-                self._recognizer.recognized.disconnect_all()
-                self._recognizer.synthesizing.disconnect_all()
-                self._recognizer.canceled.disconnect_all()
-                self._recognizer.session_started.disconnect_all()
-                self._recognizer.session_stopped.disconnect_all()
-            except Exception as e:
-                logger.debug(f"Error disconnecting handlers: {e}")
+        self._tools = llm.ToolContext.empty()
+        self._chat_ctx = llm.ChatContext.empty()
 
-        if self._audio_stream:
-            try:
-                self._audio_stream.close()
-            except Exception as e:
-                logger.debug(f"Error closing audio stream: {e}")
+        self._recognizer: Optional[speechsdk.translation.TranslationRecognizer] = None
+        self._audio_stream: Optional[speechsdk.audio.PushAudioInputStream] = None
+        self._input_resampler: Optional[rtc.AudioResampler] = None
+        self._resampler_input_rate: Optional[int] = None
+        self._resampler_input_channels: Optional[int] = None
 
-        logger.info(
-            f"Live Interpreter session closed. Total translations: {self._translation_count}"
+        self._is_running = False
+        self._session_id: Optional[str] = None
+
+        self._current_generation: Optional[_GenerationState] = None
+        self._pending_generation_fut: Optional[asyncio.Future[llm.GenerationCreatedEvent]] = None
+
+        self._shutdown = asyncio.Event()
+
+    # ------------------------------------------------------------------
+    # Properties and configuration updates
+    # ------------------------------------------------------------------
+    @property
+    def chat_ctx(self) -> llm.ChatContext:
+        return self._chat_ctx.copy()
+
+    @property
+    def tools(self) -> llm.ToolContext:
+        return self._tools.copy()
+
+    def update_options(
+        self,
+        *,
+        tool_choice: llm.ToolChoice | None = None,
+        target_languages: Optional[list[str]] = None,
+        use_personal_voice: Optional[bool] = None,
+        speaker_profile_id: Optional[str] = None,
+    ) -> None:
+        if tool_choice is not None:
+            logger.warning("Live Interpreter does not support tool choice updates. Ignoring request.")
+
+        needs_restart = False
+
+        if target_languages is not None and target_languages != self._opts.target_languages:
+            self._opts.target_languages = target_languages
+            needs_restart = True
+
+        if use_personal_voice is not None and use_personal_voice != self._opts.use_personal_voice:
+            self._opts.use_personal_voice = use_personal_voice
+            needs_restart = True
+
+        if speaker_profile_id is not None and speaker_profile_id != self._opts.speaker_profile_id:
+            self._opts.speaker_profile_id = speaker_profile_id
+            needs_restart = True
+
+        if needs_restart:
+            asyncio.create_task(self._restart_recognition())
+
+    def update_model_options(
+        self,
+        *,
+        target_languages: list[str],
+        use_personal_voice: bool,
+        speaker_profile_id: Optional[str],
+    ) -> None:
+        self.update_options(
+            target_languages=target_languages,
+            use_personal_voice=use_personal_voice,
+            speaker_profile_id=speaker_profile_id,
         )
 
+    async def update_instructions(self, instructions: str) -> None:
+        logger.warning("Live Interpreter does not support runtime instructions. Ignoring update.")
+
+    async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
+        self._chat_ctx = chat_ctx.copy()
+
+    async def update_tools(self, tools: list[llm.FunctionTool | llm.RawFunctionTool]) -> None:
+        if tools:
+            logger.warning("Live Interpreter does not support tool calls. Ignoring provided tools.")
+        self._tools = llm.ToolContext.empty()
+
+    # ------------------------------------------------------------------
+    # Session lifecycle
+    # ------------------------------------------------------------------
+    async def aclose(self) -> None:
+        self._shutdown.set()
+        await self._stop_recognition()
+
+        if self._pending_generation_fut and not self._pending_generation_fut.done():
+            self._pending_generation_fut.cancel()
+        self._pending_generation_fut = None
+
+        if self._current_generation:
+            self._finalize_generation(interrupted=True)
+
+    async def _restart_recognition(self) -> None:
+        await self._stop_recognition()
+        if self._is_running:
+            return
+        try:
+            await self._start_recognition()
+        except Exception:
+            logger.exception("Failed to restart Live Interpreter session")
+
     async def _start_recognition(self) -> None:
-        """Initialize and start the Azure Speech recognizer"""
         if self._is_running:
             return
 
-        try:
-            # Create V2 endpoint
-            v2_endpoint = models.V2_ENDPOINT_TEMPLATE.format(region=self._opts.region)
+        loop = asyncio.get_running_loop()
+        self._loop = loop
 
-            # Create translation config
+        try:
+            endpoint = models.V2_ENDPOINT_TEMPLATE.format(region=self._opts.region)
+
             translation_config = speechsdk.translation.SpeechTranslationConfig(
-                endpoint=v2_endpoint,
+                endpoint=endpoint,
                 subscription=self._opts.subscription_key,
             )
 
-            # Add target languages
             for lang in self._opts.target_languages:
                 translation_config.add_target_language(lang)
 
-            # Configure personal voice
             if self._opts.use_personal_voice:
                 translation_config.voice_name = "personal-voice"
                 if self._opts.speaker_profile_id:
@@ -295,39 +303,29 @@ class LiveInterpreterSession(llm.LLMStream):
                         self._opts.speaker_profile_id,
                     )
 
-            # Configure profanity handling
             translation_config.set_profanity(
-                getattr(
-                    speechsdk.ProfanityOption,
-                    self._opts.profanity_option.capitalize(),
-                )
+                getattr(speechsdk.ProfanityOption, self._opts.profanity_option.capitalize())
             )
 
-            # Enable word-level timestamps if requested
             if self._opts.enable_word_level_timestamps:
                 translation_config.request_word_level_timestamps()
 
-            # Create auto-detect language config (open range for Live Interpreter)
             auto_detect_config = speechsdk.AutoDetectSourceLanguageConfig()
 
-            # Create push audio stream
             audio_format = speechsdk.audio.AudioStreamFormat(
                 samples_per_second=self._opts.sample_rate,
                 bits_per_sample=16,
                 channels=1,
             )
             self._audio_stream = speechsdk.audio.PushAudioInputStream(audio_format)
-
             audio_config = speechsdk.audio.AudioConfig(stream=self._audio_stream)
 
-            # Create recognizer
             self._recognizer = speechsdk.translation.TranslationRecognizer(
                 translation_config=translation_config,
                 auto_detect_source_language_config=auto_detect_config,
                 audio_config=audio_config,
             )
 
-            # Connect event handlers
             self._recognizer.recognizing.connect(self._on_recognizing)
             self._recognizer.recognized.connect(self._on_recognized)
             self._recognizer.synthesizing.connect(self._on_synthesizing)
@@ -335,24 +333,17 @@ class LiveInterpreterSession(llm.LLMStream):
             self._recognizer.session_started.connect(self._on_session_started)
             self._recognizer.session_stopped.connect(self._on_session_stopped)
 
-            # Start continuous recognition
-            await asyncio.get_event_loop().run_in_executor(
-                None, self._recognizer.start_continuous_recognition
-            )
-
+            await loop.run_in_executor(None, self._recognizer.start_continuous_recognition)
             self._is_running = True
-            self._start_time = asyncio.get_event_loop().time()
-
             logger.info(
-                f"Live Interpreter session started. Target languages: {self._opts.target_languages}"
+                "Live Interpreter session started with targets %s",
+                self._opts.target_languages,
             )
-
-        except Exception as e:
-            logger.error(f"Failed to start Live Interpreter session: {e}")
-            raise APIConnectionError(f"Failed to connect to Azure Speech Service: {e}")
+        except Exception as exc:  # pragma: no cover - SDK level errors
+            logger.exception("Failed to start Live Interpreter session")
+            raise APIConnectionError(f"Failed to connect to Azure Speech Service: {exc}")
 
     async def _stop_recognition(self) -> None:
-        """Stop the recognition session"""
         if not self._is_running:
             return
 
@@ -360,194 +351,398 @@ class LiveInterpreterSession(llm.LLMStream):
 
         if self._recognizer:
             try:
-                await asyncio.get_event_loop().run_in_executor(
+                await asyncio.get_running_loop().run_in_executor(
                     None, self._recognizer.stop_continuous_recognition
                 )
-            except Exception as e:
-                logger.debug(f"Error stopping recognition: {e}")
+            except Exception:  # pragma: no cover - best effort
+                logger.debug("Error stopping Live Interpreter recognizer", exc_info=True)
+
+            with contextlib.suppress(Exception):
+                self._recognizer.recognizing.disconnect_all()
+                self._recognizer.recognized.disconnect_all()
+                self._recognizer.synthesizing.disconnect_all()
+                self._recognizer.canceled.disconnect_all()
+                self._recognizer.session_started.disconnect_all()
+                self._recognizer.session_stopped.disconnect_all()
+
+            self._recognizer = None
 
         if self._audio_stream:
-            try:
+            with contextlib.suppress(Exception):
                 self._audio_stream.close()
-            except Exception as e:
-                logger.debug(f"Error closing stream: {e}")
+            self._audio_stream = None
 
-    def _on_session_started(self, evt: speechsdk.SessionEventArgs) -> None:
-        """Handle session started event"""
-        self._session_id = evt.session_id
-        logger.debug(f"Session started: {self._session_id}")
+        self._input_resampler = None
+        self._resampler_input_rate = None
+        self._resampler_input_channels = None
 
-    def _on_session_stopped(self, evt: speechsdk.SessionEventArgs) -> None:
-        """Handle session stopped event"""
-        logger.debug(f"Session stopped: {evt.session_id}")
-        self._is_running = False
+    # ------------------------------------------------------------------
+    # Required realtime session interface
+    # ------------------------------------------------------------------
+    def push_audio(self, frame: rtc.AudioFrame) -> None:
+        asyncio.create_task(self._push_audio_async(frame))
 
-    def _on_recognizing(
-        self, evt: speechsdk.translation.TranslationRecognitionEventArgs
-    ) -> None:
-        """Handle intermediate recognition results"""
-        try:
-            detected_lang = evt.result.properties.get(
-                speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult,
-                "unknown",
-            )
+    async def _push_audio_async(self, frame: rtc.AudioFrame) -> None:
+        if self._shutdown.is_set():
+            return
 
-            # Note: With open range language detection, recognizing events may be limited
-            logger.debug(f"Recognizing [{detected_lang}]: {evt.result.text}")
-
-            # Create intermediate chat chunk
-            # For Live Interpreter, we primarily emit text translations
-            # Audio synthesis will be handled in the synthesizing event
-
-        except Exception as e:
-            logger.error(f"Error in recognizing handler: {e}")
-
-    def _on_recognized(
-        self, evt: speechsdk.translation.TranslationRecognitionEventArgs
-    ) -> None:
-        """Handle final recognition results"""
-        try:
-            if evt.result.reason == speechsdk.ResultReason.TranslatedSpeech:
-                detected_lang = evt.result.properties.get(
-                    speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult,
-                    "unknown",
-                )
-
-                source_text = evt.result.text
-                translations = dict(evt.result.translations)
-
-                self._translation_count += 1
-
-                logger.info(f"Recognized [{detected_lang}]: {source_text}")
-                for lang, translation in translations.items():
-                    logger.info(f"  → [{lang}]: {translation}")
-
-                # Create chat chunk with translation result
-                # Format: source text + translations
-                content = f"[{detected_lang}] {source_text}\n"
-                for lang, translation in translations.items():
-                    content += f"[{lang}] {translation}\n"
-
-                chunk = llm.ChatChunk(
-                    choices=[
-                        llm.Choice(
-                            delta=llm.ChoiceDelta(
-                                role="assistant",
-                                content=content.strip(),
-                            ),
-                            index=0,
-                        )
-                    ]
-                )
-
-                # Queue the result
-                try:
-                    self._event_queue.put_nowait(chunk)
-                except asyncio.QueueFull:
-                    logger.warning("Event queue full, dropping result")
-
-            elif evt.result.reason == speechsdk.ResultReason.NoMatch:
-                logger.debug("No speech could be recognized")
-
-        except Exception as e:
-            logger.error(f"Error in recognized handler: {e}")
-
-    def _on_synthesizing(
-        self, evt: speechsdk.translation.TranslationSynthesisEventArgs
-    ) -> None:
-        """Handle audio synthesis events"""
-        try:
-            audio = evt.result.audio
-
-            if len(audio) > 0:
-                # Store audio data
-                # In a full implementation, this would be streamed to the LiveKit room
-                asyncio.create_task(self._handle_audio_data(audio))
-
-                logger.debug(f"Audio synthesized: {len(audio)} bytes")
-
-        except Exception as e:
-            logger.error(f"Error in synthesizing handler: {e}")
-
-    async def _handle_audio_data(self, audio: bytes) -> None:
-        """Handle synthesized audio data"""
-        async with self._audio_lock:
-            self._audio_buffer.extend(audio)
-
-        # In a full implementation, this would publish audio to the LiveKit room
-        # For now, we just buffer it
-
-    def _on_canceled(
-        self, evt: speechsdk.translation.TranslationRecognitionCanceledEventArgs
-    ) -> None:
-        """Handle cancellation/error events"""
-        logger.error(f"Translation canceled: {evt.reason}")
-
-        if evt.reason == speechsdk.CancellationReason.Error:
-            error_details = evt.error_details
-            logger.error(f"Error details: {error_details}")
-
-            # Queue error
-            error = APIStatusError(
-                message=f"Azure Speech Service error: {error_details}",
-                status_code=500,
-                request_id=self._session_id,
-                body=None,
-            )
-
-            try:
-                self._event_queue.put_nowait(error)
-            except asyncio.QueueFull:
-                logger.error("Event queue full, cannot queue error")
-
-        self._is_running = False
-
-    async def push_audio(self, frame: rtc.AudioFrame) -> None:
-        """
-        Push audio frame to the Live Interpreter for translation.
-
-        Args:
-            frame: Audio frame from LiveKit room
-        """
         if not self._is_running:
             await self._start_recognition()
 
         if not self._audio_stream:
-            logger.warning("Audio stream not initialized")
+            logger.warning("Audio stream not initialized for Live Interpreter")
             return
 
         try:
-            # Resample if necessary
-            target_sample_rate = self._opts.sample_rate
-            if frame.sample_rate != target_sample_rate:
-                # Use LiveKit's resampler
-                resampler = rtc.AudioResampler(
-                    input_rate=frame.sample_rate,
-                    output_rate=target_sample_rate,
-                    num_channels=1,
-                )
-                frame = resampler.push(frame)
+            data = frame.data.tobytes()
+            channels = frame.num_channels
 
-            # Convert to bytes
-            audio_data = frame.data.tobytes()
+            if channels > 1:
+                data = audioop.tomono(data, 2, 0.5, 0.5)
+                channels = 1
 
-            # Push to Azure stream
-            await asyncio.get_event_loop().run_in_executor(
-                None, self._audio_stream.write, audio_data
+            samples_per_channel = len(data) // (2 * channels)
+
+            if frame.sample_rate != self._opts.sample_rate:
+                if (
+                    self._input_resampler is None
+                    or self._resampler_input_rate != frame.sample_rate
+                    or self._resampler_input_channels != channels
+                ):
+                    self._input_resampler = rtc.AudioResampler(
+                        input_rate=frame.sample_rate,
+                        output_rate=self._opts.sample_rate,
+                        num_channels=channels,
+                    )
+                    self._resampler_input_rate = frame.sample_rate
+                    self._resampler_input_channels = channels
+
+                input_frame = rtc.AudioFrame(data, frame.sample_rate, channels, samples_per_channel)
+                for resampled in self._input_resampler.push(input_frame):
+                    self._audio_stream.write(resampled.data.tobytes())
+            else:
+                self._audio_stream.write(data)
+        except Exception:  # pragma: no cover - SDK level exceptions
+            logger.exception("Failed to push audio to Live Interpreter")
+
+    def push_video(self, frame: rtc.VideoFrame) -> None:
+        logger.debug("Live Interpreter does not accept video input. Ignoring frame.")
+
+    def generate_reply(
+        self,
+        *,
+        instructions: NotGivenOr[str] = NOT_GIVEN,
+    ) -> asyncio.Future[llm.GenerationCreatedEvent]:
+        if instructions is not NOT_GIVEN:
+            logger.warning("Live Interpreter ignores ad-hoc instructions passed to generate_reply().")
+
+        if self._pending_generation_fut and not self._pending_generation_fut.done():
+            self._pending_generation_fut.cancel("Superseded by new generate_reply call")
+
+        fut: asyncio.Future[llm.GenerationCreatedEvent] = asyncio.Future()
+        self._pending_generation_fut = fut
+
+        def _on_timeout() -> None:
+            if fut.done():
+                return
+            fut.set_exception(llm.RealtimeError("generate_reply timed out waiting for generation"))
+            if self._pending_generation_fut is fut:
+                self._pending_generation_fut = None
+
+        handle = self._loop.call_later(15.0, _on_timeout)
+        fut.add_done_callback(lambda _: handle.cancel())
+        return fut
+
+    def commit_audio(self) -> None:
+        # Azure continuously consumes audio; no explicit commit is required.
+        pass
+
+    def clear_audio(self) -> None:
+        # Azure SDK does not support clearing buffered audio mid-session.
+        logger.debug("clear_audio called but not supported by Live Interpreter")
+
+    def interrupt(self) -> None:
+        logger.debug("interrupt called but Live Interpreter does not expose interruption controls")
+
+    def truncate(
+        self,
+        *,
+        message_id: str,
+        modalities: list[Literal["text", "audio"]],
+        audio_end_ms: int,
+        audio_transcript: NotGivenOr[str] = NOT_GIVEN,
+    ) -> None:
+        logger.warning("truncate is not supported by Live Interpreter. Ignoring request for %s", message_id)
+
+    # ------------------------------------------------------------------
+    # Azure SDK callbacks (threaded)
+    # ------------------------------------------------------------------
+    def _on_session_started(self, evt: speechsdk.SessionEventArgs) -> None:
+        self._session_id = evt.session_id
+        logger.debug("Live Interpreter session started: %s", self._session_id)
+
+    def _on_session_stopped(self, evt: speechsdk.SessionEventArgs) -> None:
+        logger.debug("Live Interpreter session stopped: %s", evt.session_id)
+        self._loop.call_soon_threadsafe(self._handle_session_stopped)
+
+    def _handle_session_stopped(self) -> None:
+        self._is_running = False
+
+    def _on_recognizing(self, evt: speechsdk.translation.TranslationRecognitionEventArgs) -> None:
+        detected = evt.result.properties.get(
+            speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult,
+            "unknown",
+        )
+        logger.debug("Recognizing [%s]: %s", detected, evt.result.text)
+
+    def _on_recognized(self, evt: speechsdk.translation.TranslationRecognitionEventArgs) -> None:
+        if evt.result.reason != speechsdk.ResultReason.TranslatedSpeech:
+            return
+
+        detected = evt.result.properties.get(
+            speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult,
+            "unknown",
+        )
+        source_text = evt.result.text
+        translations = dict(evt.result.translations)
+
+        self._loop.call_soon_threadsafe(
+            self._handle_final_translation, detected, source_text, translations
+        )
+
+    def _on_synthesizing(self, evt: speechsdk.translation.TranslationSynthesisEventArgs) -> None:
+        audio = evt.result.audio
+        self._loop.call_soon_threadsafe(self._handle_audio_chunk, audio)
+
+    def _on_canceled(self, evt: speechsdk.translation.TranslationRecognitionCanceledEventArgs) -> None:
+        reason = evt.reason
+        details = evt.error_details
+        self._loop.call_soon_threadsafe(self._handle_cancellation, reason, details)
+
+    # ------------------------------------------------------------------
+    # Event handlers running on the asyncio loop
+    # ------------------------------------------------------------------
+    def _ensure_generation(self) -> _GenerationState:
+        if self._current_generation and not self._current_generation.audio_done:
+            return self._current_generation
+
+        response_id = utils.shortuuid("azure-li-")
+        text_ch = utils.aio.Chan[str]()
+        audio_ch = utils.aio.Chan[rtc.AudioFrame]()
+        modalities: asyncio.Future[list[Literal["text", "audio"]]] = asyncio.Future()
+        if self._realtime_model.capabilities.audio_output:
+            modalities.set_result(["audio", "text"])
+        else:
+            modalities.set_result(["text"])
+
+        message_generation = llm.MessageGeneration(
+            message_id=response_id,
+            text_stream=text_ch,
+            audio_stream=audio_ch,
+            modalities=modalities,
+        )
+
+        message_ch = utils.aio.Chan[llm.MessageGeneration]()
+        message_ch.send_nowait(message_generation)
+
+        generation = _GenerationState(
+            response_id=response_id,
+            message_ch=message_ch,
+            function_ch=utils.aio.Chan[llm.FunctionCall](),
+            text_ch=text_ch,
+            audio_ch=audio_ch,
+            modalities=modalities,
+            created_at=time.time(),
+            audio_expected=self._realtime_model.capabilities.audio_output,
+        )
+
+        self._current_generation = generation
+
+        generation_event = llm.GenerationCreatedEvent(
+            message_stream=message_ch,
+            function_stream=generation.function_ch,
+            user_initiated=self._pending_generation_fut is not None,
+        )
+        self.emit("generation_created", generation_event)
+
+        if self._pending_generation_fut and not self._pending_generation_fut.done():
+            self._pending_generation_fut.set_result(generation_event)
+        self._pending_generation_fut = None
+
+        return generation
+
+    def _handle_audio_chunk(self, audio: bytes) -> None:
+        if not self._realtime_model.capabilities.audio_output:
+            return
+
+        generation = self._ensure_generation()
+
+        if len(audio) == 0:
+            generation.audio_done = True
+            if not generation.audio_ch.closed:
+                generation.audio_ch.close()
+            self._maybe_finalize_generation()
+            return
+
+        sample_rate, num_channels, pcm_bytes = self._decode_audio(audio)
+
+        if num_channels > 1:
+            pcm_bytes = audioop.tomono(pcm_bytes, 2, 0.5, 0.5)
+            num_channels = 1
+
+        chunk_bytes = realtime_utils.chunk_audio(
+            pcm_bytes,
+            chunk_duration_ms=_AUDIO_CHUNK_MS,
+            sample_rate=sample_rate,
+        )
+
+        for chunk in chunk_bytes:
+            if not chunk:
+                continue
+            frame = rtc.AudioFrame(
+                data=chunk,
+                sample_rate=sample_rate,
+                num_channels=num_channels,
+                samples_per_channel=len(chunk) // (2 * num_channels),
+            )
+            generation.audio_ch.send_nowait(frame)
+
+            if generation.first_token_at is None:
+                generation.first_token_at = time.time()
+
+    def _handle_final_translation(
+        self,
+        source_lang: str,
+        source_text: str,
+        translations: dict[str, str],
+    ) -> None:
+        generation = self._ensure_generation()
+
+        lines = [f"[{source_lang}] {source_text}"]
+        for lang, text in translations.items():
+            lines.append(f"[{lang}] {text}")
+
+        final_text = "\n".join(lines)
+        generation.output_text.append(final_text)
+        generation.text_ch.send_nowait(final_text)
+        generation.text_ch.close()
+        generation.text_done = True
+        generation.completed_at = time.time()
+
+        self._maybe_finalize_generation()
+
+    def _handle_cancellation(
+        self,
+        reason: speechsdk.CancellationReason,
+        details: str | None,
+    ) -> None:
+        logger.error("Live Interpreter canceled: %s (%s)", reason, details)
+
+        error = llm.RealtimeModelError(
+            timestamp=time.time(),
+            label=self._realtime_model.label,
+            error=RuntimeError(details or "Live Interpreter canceled"),
+            recoverable=True,
+        )
+        self.emit("error", error)
+
+        if self._current_generation:
+            self._finalize_generation(interrupted=True)
+
+        if self._pending_generation_fut and not self._pending_generation_fut.done():
+            self._pending_generation_fut.set_exception(
+                llm.RealtimeError(details or "Live Interpreter canceled")
+            )
+            self._pending_generation_fut = None
+
+    def _maybe_finalize_generation(self) -> None:
+        generation = self._current_generation
+        if not generation:
+            return
+
+        if not generation.text_done:
+            return
+
+        if generation.audio_expected and not generation.audio_done:
+            return
+
+        self._finalize_generation(interrupted=False)
+
+    def _finalize_generation(self, interrupted: bool) -> None:
+        generation = self._current_generation
+        if not generation:
+            return
+
+        if not generation.text_ch.closed:
+            generation.text_ch.close()
+        if not generation.audio_ch.closed:
+            generation.audio_ch.close()
+
+        generation.function_ch.close()
+        generation.message_ch.close()
+
+        if generation.output_text:
+            self._chat_ctx.add_message(
+                role="assistant",
+                content="\n\n".join(generation.output_text),
+                id=generation.response_id,
             )
 
-        except Exception as e:
-            logger.error(f"Error pushing audio: {e}")
+        created = generation.created_at
+        completed = generation.completed_at or time.time()
+        ttft = (
+            generation.first_token_at - created
+            if generation.first_token_at and generation.first_token_at >= created
+            else -1
+        )
+        duration = completed - created
 
-    def get_audio_buffer(self) -> bytes:
-        """
-        Get buffered synthesized audio.
+        metrics = RealtimeModelMetrics(
+            timestamp=created,
+            request_id=generation.response_id,
+            ttft=ttft,
+            duration=duration,
+            cancelled=interrupted,
+            label=self._realtime_model.label,
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            tokens_per_second=0,
+            input_token_details=RealtimeModelMetrics.InputTokenDetails(
+                audio_tokens=0,
+                cached_tokens=0,
+                text_tokens=0,
+                cached_tokens_details=None,
+                image_tokens=0,
+            ),
+            output_token_details=RealtimeModelMetrics.OutputTokenDetails(
+                text_tokens=0,
+                audio_tokens=0,
+                image_tokens=0,
+            ),
+            metadata=Metadata(
+                model_name=self._realtime_model.model,
+                model_provider=self._realtime_model.provider,
+            ),
+        )
+        self.emit("metrics_collected", metrics)
 
-        Returns:
-            Bytes of synthesized audio (WAV format)
-        """
-        return bytes(self._audio_buffer)
+        self._current_generation = None
 
-    def clear_audio_buffer(self) -> None:
-        """Clear the audio buffer"""
-        self._audio_buffer.clear()
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _decode_audio(data: bytes) -> tuple[int, int, bytes]:
+        if not data:
+            return 16000, 1, b""
+
+        if data[:4] != b"RIFF":
+            return 16000, 1, data
+
+        with wave.open(io.BytesIO(data), "rb") as wav:
+            sample_rate = wav.getframerate()
+            num_channels = wav.getnchannels()
+            frames = wav.readframes(wav.getnframes())
+
+        return sample_rate, num_channels, frames

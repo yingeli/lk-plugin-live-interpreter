@@ -31,7 +31,7 @@ import logging
 from dotenv import load_dotenv
 
 from livekit.agents import JobContext, WorkerOptions, cli
-from livekit.agents.voice import AgentSession
+from livekit.agents.voice import Agent, AgentSession
 from livekit.plugins import azure
 
 # Configure logging
@@ -56,16 +56,21 @@ async def entrypoint(ctx: JobContext):
 
     logger.info(f"Starting Live Interpreter in room: {ctx.room.name}")
 
-    # Create agent session with Live Interpreter model
-    session = AgentSession()
-
-    await session.start(
-        # Configure Live Interpreter with target languages
+    # Create the agent with Live Interpreter model
+    agent = Agent(
+        instructions="You are a live interpreter. Translate speech to French and Spanish in real-time.",
         llm=azure.realtime.LiveInterpreterModel(
             target_languages=["fr", "es"],  # French and Spanish
             use_personal_voice=True,  # Preserve speaker characteristics
             sample_rate=16000,  # 16kHz audio
         ),
+    )
+
+    # Create agent session
+    session = AgentSession()
+
+    await session.start(
+        agent=agent,
         room=ctx.room,
     )
 

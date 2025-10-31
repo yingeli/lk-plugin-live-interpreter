@@ -36,7 +36,7 @@ import os
 from dotenv import load_dotenv
 
 from livekit.agents import JobContext, WorkerOptions, cli
-from livekit.agents.voice import AgentSession
+from livekit.agents.voice import Agent, AgentSession
 from livekit.plugins import azure
 
 logger = logging.getLogger("custom-voice-interpreter")
@@ -69,10 +69,9 @@ async def entrypoint(ctx: JobContext):
     if speaker_profile_id:
         logger.info(f"Using speaker profile: {speaker_profile_id}")
 
-    # Create agent session
-    session = AgentSession()
-
-    await session.start(
+    # Create the agent with custom voice model
+    agent = Agent(
+        instructions="You are a custom voice interpreter. Translate speech using the specified personal voice profile.",
         llm=azure.realtime.LiveInterpreterModel(
             target_languages=["fr", "es", "de"],
             use_personal_voice=True,
@@ -80,12 +79,19 @@ async def entrypoint(ctx: JobContext):
             sample_rate=24000,  # Higher quality audio
             enable_word_level_timestamps=True,
         ),
+    )
+
+    # Create agent session
+    session = AgentSession()
+
+    await session.start(
+        agent=agent,
         room=ctx.room,
     )
 
     logger.info("Custom voice interpreter ready")
 
-    await session.wait_for_completion()
+    # Session will remain active until the room is closed
 
 
 if __name__ == "__main__":
